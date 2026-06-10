@@ -225,7 +225,9 @@ AsyncClient::AsyncClient(tcp_pcb* pcb):
 AsyncClient::~AsyncClient(){
   if(_pcb)
     _close();
-
+#if LWIP_IPV6
+  _he_clear();
+#endif
   _errorTracker->clearClient();
 }
 
@@ -236,6 +238,131 @@ inline void clearTcpCallbacks(tcp_pcb* pcb){
       tcp_err(pcb, NULL);
       tcp_poll(pcb, NULL, 0);
 }
+
+#if LWIP_IPV6
+u8_t AsyncClient::_dnsAddrType = LWIP_DNS_ADDRTYPE_IPV4_IPV6;
+AsyncClient::heFailHint AsyncClient::_he_failHints[AsyncClient::HE_FAIL_SLOTS] = {};
+
+// A hint is active while unexpired. millis() subtraction is
+// overflow-safe (unsigned arithmetic).
+bool AsyncClient::_he_failHintActive(const char* host){
+  if(!host){
+    return false;
+  }
+  for(int i = 0; i < HE_FAIL_SLOTS; i++){
+    if(_he_failHints[i].host && strcmp(_he_failHints[i].host, host) == 0){
+      if((millis() - _he_failHints[i].stamp) < HE_FAIL_TTL_MS){
+        return true;
+      }
+      ::free(_he_failHints[i].host);                  // Expired: retire the slot
+      _he_failHints[i].host = NULL;
+      return false;
+    }
+  }
+  return false;
+}
+
+void AsyncClient::_he_failHintClear(const char* host){
+  for(int i = 0; i < HE_FAIL_SLOTS; i++){
+    if(_he_failHints[i].host && (!host || strcmp(_he_failHints[i].host, host) == 0)){
+      ::free(_he_failHints[i].host);
+      _he_failHints[i].host = NULL;
+    }
+  }
+}
+
+void AsyncClient::setDnsAddrType(u8_t addrtype){
+  _dnsAddrType = addrtype;
+  // Preference (re)set marks a configuration event: drop the failure
+  // hints so the preferred family gets a fresh chance.
+  _he_failHintClear(NULL);
+}
+
+u8_t AsyncClient::getDnsAddrType(){
+  return _dnsAddrType;
+}
+
+// Strict opposite family of an attempt. Strict single-family types are
+// required here: the combined preference types (IPV4_IPV6 / IPV6_IPV4)
+// only order FRESH queries - a cached entry of the wrong family still
+// satisfies them, so a flip would re-fetch the very address that just
+// failed. The strict types are family-filtered against the cache and
+// force a fresh query for the other record.
+u8_t AsyncClient::_he_flipType(u8_t addrtype){
+  bool wasV6 = (addrtype == LWIP_DNS_ADDRTYPE_IPV6_IPV4) ||
+               (addrtype == LWIP_DNS_ADDRTYPE_IPV6);
+  return wasV6 ? LWIP_DNS_ADDRTYPE_IPV4 : LWIP_DNS_ADDRTYPE_IPV6;
+}
+
+void AsyncClient::_he_setHost(const char* host, uint16_t port){
+  _he_clear();
+  _he_host = strdup(host);
+  _he_flipped = false;
+  _connect_port = port;
+}
+
+void AsyncClient::_he_clear(){
+  if(_he_host){
+    ::free(_he_host);
+    _he_host = NULL;
+  }
+}
+
+// Remember that this host's preferred-family attempt failed so the next
+// attempts (until the TTL expires) start on the opposite family.
+void AsyncClient::_he_recordFail(){
+  if(!_he_host){
+    return;
+  }
+  uint32_t now = millis();
+  for(int i = 0; i < HE_FAIL_SLOTS; i++){
+    if(_he_failHints[i].host && strcmp(_he_failHints[i].host, _he_host) == 0){
+      _he_failHints[i].stamp = now;                 // Refresh existing hint
+      return;
+    }
+  }
+  int slot = 0;                                     // Empty slot, else oldest (LRU)
+  uint32_t oldestAge = 0;
+  for(int i = 0; i < HE_FAIL_SLOTS; i++){
+    if(!_he_failHints[i].host){
+      slot = i;
+      break;
+    }
+    uint32_t age = now - _he_failHints[i].stamp;
+    if(age >= oldestAge){
+      slot = i;
+      oldestAge = age;
+    }
+  }
+  ::free(_he_failHints[slot].host);
+  _he_failHints[slot].host = strdup(_he_host);
+  _he_failHints[slot].stamp = now;
+}
+
+// One opposite-address-family retry after a failed connect attempt.
+// The dns_addrtype fallback in connect(host, port) only covers a missing
+// DNS record; this covers a record that exists but points to an
+// unreachable path (for example a published AAAA on a network whose IPv6
+// routing is broken). Sequential, one pcb at a time.
+bool AsyncClient::_he_flip(){
+  if(!_he_host || _he_flipped){
+    return false;
+  }
+  _he_flipped = true;
+  _he_usedType = _he_flipType(_he_usedType);
+  IPAddress addr;
+  err_t err = dns_gethostbyname_addrtype(_he_host, addr,
+      (dns_found_callback)&_s_dns_found, this, _he_usedType);
+  if(err == ERR_OK){
+#if ASYNC_TCP_SSL_ENABLED
+    return connect(addr, _connect_port, _pcb_secure);
+#else
+    return connect(addr, _connect_port);
+#endif
+  }
+  return (err == ERR_INPROGRESS);
+}
+#endif // LWIP_IPV6
 
 #if ASYNC_TCP_SSL_ENABLED
 bool AsyncClient::connect(IPAddress ip, uint16_t port, bool secure){
@@ -252,7 +379,10 @@ bool AsyncClient::connect(IPAddress ip, uint16_t port){
     return false;
   }
 #endif
-  tcp_pcb* pcb = tcp_new();
+  // IP_ANY_TYPE lets tcp_connect() set the PCB address type from the
+  // destination, so the same path serves IPv4 and IPv6 peers. Matches
+  // the listening side (AsyncServer::begin).
+  tcp_pcb* pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
   if (!pcb){ //could not allocate pcb
     return false;
   }
@@ -264,8 +394,23 @@ bool AsyncClient::connect(IPAddress ip, uint16_t port){
 #endif
   tcp_arg(pcb, this);
   tcp_err(pcb, &_s_error);
+#if LWIP_IPV6
+  _he_connecting = true;
+#endif
   size_t err = tcp_connect(pcb, addr, port,(tcp_connected_fn)&_s_connected);
-  return (ERR_OK == err);
+  if(ERR_OK != err){
+    // Synchronous connect failure (e.g. ERR_RTE with no route for the
+    // address family, ERR_MEM). lwIP did not take ownership of the pcb and
+    // will never invoke the error callback for it, so free it here or it
+    // leaks. Clear the callbacks first: tcp_abort() fires the err callback
+    // via tcp_abandon(), which would re-enter _error(ERR_ABRT).
+    // _he_connecting stays set so a caller-side _error() (the happy-
+    // eyeballs flip path) still owns flip/fail-hint handling.
+    clearTcpCallbacks(pcb);
+    tcp_abort(pcb);
+    return false;
+  }
+  return true;
 }
 
 #if ASYNC_TCP_SSL_ENABLED
@@ -274,7 +419,23 @@ bool AsyncClient::connect(const char* host, uint16_t port, bool secure){
 bool AsyncClient::connect(const char* host, uint16_t port){
 #endif
   IPAddress addr;
+#if LWIP_IPV6
+  // Resolve per the configured preference (default: A records first, then
+  // AAAA). IPv4-first keeps hosts without IPv6 connectivity working
+  // unchanged and avoids a failing AAAA lookup ahead of every connection
+  // to the (still common) v4-only services. See setDnsAddrType(). If a
+  // previous attempt to this host failed on the preferred family, start
+  // on the opposite one.
+  _he_setHost(host, port);
+  _he_usedType = _dnsAddrType;
+  if(_he_failHintActive(host)){
+    _he_usedType = _he_flipType(_dnsAddrType);
+  }
+  err_t err = dns_gethostbyname_addrtype(host, addr,
+      (dns_found_callback)&_s_dns_found, this, _he_usedType);
+#else
   err_t err = dns_gethostbyname(host, addr, (dns_found_callback)&_s_dns_found, this);
+#endif
   if(err == ERR_OK) {
 #if ASYNC_TCP_SSL_ENABLED
     return connect(addr, port, secure);
@@ -349,6 +510,15 @@ void AsyncClient::abort(){
     _pcb = NULL;
     setCloseError(ERR_ABRT);
   }
+#if LWIP_IPV6
+  // Same reasoning as in _close(): an abort during the connect phase
+  // marks the attempted family as failed for this host.
+  if(_he_connecting && _he_host && !_he_flipped){
+    _he_recordFail();
+  }
+  _he_connecting = false;
+  _he_clear();
+#endif
   return;
 }
 
@@ -464,6 +634,14 @@ void AsyncClient::_connected(std::shared_ptr<ACErrorTracker>& errorTracker, void
 
   _pcb = reinterpret_cast<tcp_pcb*>(pcb);
   if(_pcb){
+#if LWIP_IPV6
+    _he_connecting = false;
+    // Success on the preferred family clears a stale failure hint.
+    if(_he_host && _he_usedType == _dnsAddrType){
+      _he_failHintClear(_he_host);
+    }
+    _he_clear();
+#endif
     _pcb_busy = false;
     _rx_last_packet = millis();
     tcp_setprio(_pcb, TCP_PRIO_MIN);
@@ -492,6 +670,17 @@ void AsyncClient::_connected(std::shared_ptr<ACErrorTracker>& errorTracker, void
 }
 
 void AsyncClient::_close(){
+#if LWIP_IPV6
+  // An application-initiated close/abort during the connect phase (for
+  // example an HTTP-layer timeout against a silent blackhole) counts as
+  // a failed attempt for the family-failure hint, even though lwIP never
+  // reported an error.
+  if(_he_connecting && _he_host && !_he_flipped){
+    _he_recordFail();
+  }
+  _he_connecting = false;
+  _he_clear();
+#endif
   if(_pcb) {
 #if ASYNC_TCP_SSL_ENABLED
     if(_pcb_secure){
@@ -526,6 +715,19 @@ void AsyncClient::_error(err_t err) {
     // made to set to NULL other callbacks.
     _pcb = NULL;
   }
+#if LWIP_IPV6
+  // Happy-eyeballs-lite: a connect-phase failure gets one retry with the
+  // opposite address family before the error is surfaced.
+  if(_he_connecting && !_he_flipped && _he_host){
+    _he_connecting = false;
+    _he_recordFail();
+    if(_he_flip()){
+      return;
+    }
+  }
+  _he_connecting = false;
+  _he_clear();
+#endif
   if(_error_cb)
     _error_cb(_error_cb_arg, this, err);
   if(_discard_cb)
@@ -705,11 +907,26 @@ void AsyncClient::_dns_found(const ip_addr *ipaddr){
 #endif
   if(ipaddr){
 #if ASYNC_TCP_SSL_ENABLED
-    connect(ipaddr, _connect_port, _pcb_secure);
+    bool connected = connect(ipaddr, _connect_port, _pcb_secure);
 #else
-    connect(ipaddr, _connect_port);
+    bool connected = connect(ipaddr, _connect_port);
 #endif
+    if(!connected && !_pcb){
+      // Synchronous connect failure after async DNS resolution (e.g.
+      // ERR_RTE: resolved family has no route). Without this the failure
+      // is silent: no connect/error/timeout callback ever fires and the
+      // application waits forever. Route it through _error() so the
+      // happy-eyeballs flip (if still armed) or the error/discard
+      // callbacks run. The !_pcb guard skips the already-connected case.
+      _error(ERR_RTE);
+    }
   } else {
+#if LWIP_IPV6
+    // No record in either family (the dns_addrtype query already falls
+    // back across record types) - nothing for happy-eyeballs to retry.
+    _he_connecting = false;
+    _he_clear();
+#endif
     if(_error_cb)
       _error_cb(_error_cb_arg, this, -55);
     if(_discard_cb)

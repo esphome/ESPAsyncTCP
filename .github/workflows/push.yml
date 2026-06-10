@@ -30,3 +30,30 @@ jobs:
       run: pip install --upgrade platformio
     - name: Build Tests
       run: bash ./.github/scripts/on-push.sh 1 1
+
+  build-ipv6:
+    name: IPv6 lwIP build check
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744  # v3.6.0
+    - uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c  # v3.5.0
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.platformio/.cache
+        key: ${{ runner.os }}-pio
+    - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c  # v4.9.1
+      with:
+        python-version: '3.11'
+    - name: Install PlatformIO Core
+      run: pip install --upgrade platformio
+    # build-pio compiles the IPv4-only lwIP variant, so the LWIP_IPV6 code is
+    # never built there. Compile the examples against an IPv6 lwIP variant so
+    # the IPv6 paths get coverage too.
+    - name: Compile examples with the IPv6 lwIP variant
+      run: |
+        for ex in examples/ClientServer/Client examples/ClientServer/Server examples/SyncClient; do
+          python -m platformio ci -l '.' --board esp12e "$ex" --project-option="board_build.partitions = huge_app.csv"
+        done
+      env:
+        PLATFORMIO_BUILD_FLAGS: -DPIO_FRAMEWORK_ARDUINO_LWIP2_IPV6_LOW_MEMORY
